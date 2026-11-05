@@ -42,6 +42,12 @@ VanishCam features an **All-In-One Universal Mode** where every meme gesture is 
 - **Visuals**: Instant puff of volumetric smoke as you dissolve, leaving behind an original anime-style wooden substitution log that falls and rests on the ground.
 - **Sound**: Authentic ninja vanish sound effect.
 
+### 2b. Instant Transmission Travel
+- **Setup**: Choose any landscape image as a destination (**Choose destination…** in the Mac app, or `--destination-file PATH`).
+- **Gesture**: The Goku gesture travels instead of vanishing while a destination is set; repeat it to come home. Key `4` or **Travel** does the same.
+- **Visuals**: A flash and zoom blur leave the current place, then the destination rushes in behind you while you stay visible. The destination shifts slightly as you move so the camera feels like it came with you.
+- **Note**: Travel does not need a saved background. Lighting is not matched to the destination.
+
 ### 3. Normal Dissolve Vanish
 - **Gesture**: Flash a steady, still Peace Sign (V-sign) with one hand.
 - **Visuals**: Shimmering particle dissolve with a cyan edge glow, seamlessly blending your silhouette into the captured background.
@@ -197,9 +203,11 @@ the last frame is not reused as a success-shaped fallback.
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/tanmayybuilds/VanishCam.git
+   git clone https://github.com/Schtechel/VanishCam.git
    cd VanishCam
    ```
+   This fork adds the native macOS app and travel mode to the original
+   [tanmayybuilds/VanishCam](https://github.com/tanmayybuilds/VanishCam).
 
 2. **Launch with One Click (Windows Batch Launchers)**:
    - **`START_ALL_CAMERAS.bat`**: Universal All-In-One Mode (Recommended).
@@ -208,7 +216,7 @@ the last frame is not reused as a success-shaped fallback.
    - **`START_NORMAL.bat`**: Direct launch into Normal Dissolve mode.
    - **`START_OBS.bat`**: Clean preview window for OBS Window Capture.
 
-   *The batch launchers automatically configure a local `.venv-local` virtual environment and install all dependencies on the first run.*
+   *First run `local_app\START_LOCAL.bat` once: it creates the local `.venv-local` virtual environment and installs all dependencies. The other launchers expect that environment to exist.*
 
 3. **Or run manually with Python**:
    ```bash
@@ -238,6 +246,7 @@ the last frame is not reused as a success-shaped fallback.
 | **`1`** | Manually trigger Normal Dissolve vanish (or reappear) |
 | **`2`** | Manually trigger Naruto Substitution Jutsu (or reappear) |
 | **`3`** | Manually trigger Goku Instant Transmission (or reappear) |
+| **`4`** | Travel to the destination image (or come home) |
 | **`C`** | Cycle to next available webcam index (0, 1, 2, ...) |
 | **`F`** | Toggle Fullscreen window |
 | **`Q` / `ESC`** | Quit application and release camera devices |
@@ -260,6 +269,7 @@ Options:
   --no-virtual-camera              Disable virtual camera driver output
   --menu                           Show interactive startup mode selection menu
   --gesture-debug                  Print real-time tracking diagnostics in console
+  --destination-file PATH          Image to travel to with Instant Transmission
   --self-test                      Verify model assets and audio pipeline offline
 ```
 

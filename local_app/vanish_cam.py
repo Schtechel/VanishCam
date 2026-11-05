@@ -38,8 +38,14 @@ try:
         EFFECT_SECONDS, joined_hands_from_landmarks, landed_log_anchor,
         load_log, overlay_log, render_substitution, substitution_anchor,
     )
+    from .travel_effect import (
+        TRAVEL_SECONDS, Destination, load_destination, render_at_destination, render_travel,
+    )
     from .vanish_sound import SOUND_PATH, VanishSound
 except ImportError:
+    from travel_effect import (
+        TRAVEL_SECONDS, Destination, load_destination, render_at_destination, render_travel,
+    )
     from goku_effect import (
         GOKU_HOLD_SECONDS, GOKU_TELEPORT_SECONDS, TELEPORT_SOUND_PATH,
         goku_pose_from_landmarks, render_goku_charging, render_goku_teleport,
@@ -77,6 +83,7 @@ BACKGROUND_SAMPLE_SECONDS = 0.55
 VANISH_SECONDS = 3.6
 GESTURE_INTERVAL_SECONDS = 0.14
 GESTURE_HOLD_SECONDS = GOKU_HOLD_SECONDS
+TRAVEL_PHASES = ("travel_departing", "traveled", "travel_returning")
 GESTURE_RELEASE_SECONDS = 0.4
 GESTURE_MAX_SAMPLE_GAP = 0.35
 GESTURE_MAX_DRIFT = 0.035
@@ -147,6 +154,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manual-calibration", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--capture-size", help="Native camera resolution, e.g. 1920x1080")
     parser.add_argument("--controls-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--destination-file", type=Path,
+        help="Image to travel to with Instant Transmission (Goku gesture or key 4)",
+    )
     return parser.parse_args()
 
 
@@ -214,7 +225,7 @@ def consume_key_request(path: Path | None) -> int:
         return -1
     value = path.read_text()
     path.unlink()
-    if value not in ("1", "2", "3", "r", " ", "q"):
+    if value not in ("1", "2", "3", "4", "r", " ", "q"):
         raise RuntimeError("Invalid app control request.")
     return ord(value)
 
@@ -1374,6 +1385,13 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     current_camera_index = camera_index
     last_triggered_effect = "goku" if mode in ("all", "goku") else mode
     goku_reappeared_at = 0.0
+    destination_file = getattr(args, "destination_file", None)
+    destination_image: np.ndarray | None = None
+    destination_stamp: float | None = None
+    destination_checked_at = float("-inf")
+    destination: Destination | None = None
+    travel_home_phase = "ready"
+    travel_arrived_at = 0.0
     started = time.perf_counter()
     if background is None:
         if state.phase == "unconfigured":
@@ -1437,8 +1455,67 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
             elapsed_ms = int((now - started) * 1000)
             mp_image = None
 
+            if destination_file is not None and now - destination_checked_at >= 0.5:
+                destination_checked_at = now
+                try:
+                    stamp = destination_file.stat().st_mtime
+                except OSError:
+                    stamp = None
+                if stamp != destination_stamp:
+                    destination_stamp = stamp
+                    destination_image = load_destination(destination_file) if stamp is not None else None
+                    destination = None
+                    print("[Travel] Destination " + ("ready." if destination_image is not None else "cleared."))
+            if destination_image is None:
+                destination = None
+                if state.phase in TRAVEL_PHASES:
+                    state.phase = travel_home_phase
+            elif destination is None or (destination.width, destination.height) != (width, height):
+                destination = Destination(destination_image, width, height)
+            can_travel = (
+                destination is not None and mode == "all" and gestures_enabled
+                and now - goku_reappeared_at >= 2.0
+            )
+
             if not effects_enabled:
                 display = camera_frame
+            elif state.phase in TRAVEL_PHASES:
+                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                travel_mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
+                age = max(0.01, now - (now if state.vanish_started is None else state.vanish_started))
+                if state.phase == "travel_departing":
+                    display = render_travel(camera_frame, travel_mask, destination, age, arriving=True)
+                    if age >= TRAVEL_SECONDS:
+                        state.phase = "traveled"
+                        travel_arrived_at = now
+                        print("[Travel] Arrived.")
+                elif state.phase == "travel_returning":
+                    display = render_travel(camera_frame, travel_mask, destination, age, arriving=False)
+                    if age >= TRAVEL_SECONDS:
+                        state.phase = travel_home_phase
+                        state.vanish_started = None
+                        goku_reappeared_at = now
+                        print("[Travel] Back home.")
+                else:
+                    display = render_at_destination(camera_frame, travel_mask, destination)
+                    charging_progress = 0.0
+                    charging_tip = None
+                    if (
+                        mode == "all" and gestures_enabled and now - travel_arrived_at >= 2.0
+                        and now - state.last_gesture_check >= 0.06
+                    ):
+                        state.last_gesture_check = now
+                        action, val, tip = recognizer.update(mp_image, elapsed_ms, now)
+                        if action == "goku_charging":
+                            charging_progress, charging_tip = val, tip
+                        elif action == "goku":
+                            state.phase = "travel_returning"
+                            state.vanish_started = time.perf_counter()
+                            play_teleport()
+                            print("[Travel] Instant Transmission home!")
+                    if charging_progress > 0 and charging_tip is not None:
+                        display = render_goku_charging(display, charging_tip, charging_progress)
             elif state.phase == "calibrating":
                 elapsed = now - state.calibration_started
                 remaining = max(0, int(np.ceil(CALIBRATION_SECONDS - elapsed)))
@@ -1478,6 +1555,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             elif state.phase == "unconfigured":
                 display = camera_frame
+                if can_travel and now - state.last_gesture_check >= 0.06:
+                    state.last_gesture_check = now
+                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    action, val, tip = recognizer.update(mp_image, elapsed_ms, now)
+                    charging_progress, charging_tip = (val, tip) if action == "goku_charging" else (0.0, None)
+                    if action == "goku":
+                        travel_home_phase = state.phase
+                        state.phase = "travel_departing"
+                        state.vanish_started = time.perf_counter()
+                        play_teleport()
+                        charging_progress, charging_tip = 0.0, None
+                        print("[Travel] Instant Transmission!")
+                if charging_progress > 0 and charging_tip is not None:
+                    display = render_goku_charging(display, charging_tip, charging_progress)
 
             elif background is None:
                 state.phase = "calibrating"
@@ -1573,6 +1665,12 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                             play_vanish()
                             vanished_frame = None
                             print("[All-In-One] Naruto Substitution Jutsu!!")
+                        elif action == "goku" and destination is not None:
+                            travel_home_phase = state.phase
+                            state.phase = "travel_departing"
+                            state.vanish_started = time.perf_counter()
+                            play_teleport()
+                            print("[Travel] Instant Transmission!")
                         elif action == "goku":
                             last_triggered_effect = "goku"
                             state.phase = "goku_vanishing"
@@ -1669,6 +1767,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         state.vanish_started = None
                         goku_reappeared_at = time.perf_counter()
                         print("[Goku] Reappeared! 2s cooldown before teleporting again.")
+                elif state.phase in TRAVEL_PHASES:
+                    display = camera_frame
                 elif state.phase == "ready":
                     if charging_progress > 0 and charging_tip is not None:
                         display = render_goku_charging(camera_frame, charging_tip, charging_progress)
@@ -1701,6 +1801,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         status += " · Background saved"
                 elif state.phase == "vanished":
                     status = "Hidden: showing saved background"
+                elif state.phase == "traveled":
+                    status = "At destination"
+                elif state.phase in TRAVEL_PHASES:
+                    status = "Instant Transmission"
                 elif state.phase == "unconfigured":
                     status = "Live camera: set framing, then Reset background for effects"
                 else:
@@ -1827,6 +1931,27 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         state.vanish_started = time.perf_counter()
                         vanished_frame = None
                         play_teleport()
+            elif key == ord("4"):
+                if destination is None:
+                    print("[Travel] Choose a destination image first.")
+                elif state.phase in ("ready", "unconfigured"):
+                    travel_home_phase = state.phase
+                    state.phase = "travel_departing"
+                    state.vanish_started = time.perf_counter()
+                    charging_progress, charging_tip = 0.0, None
+                    play_teleport()
+                    print("[Manual Key 4] Instant Transmission!")
+                elif state.phase == "traveled":
+                    state.phase = "travel_returning"
+                    state.vanish_started = time.perf_counter()
+                    play_teleport()
+                    print("[Manual Key 4] Instant Transmission home!")
+            elif key == ord("r") and state.phase in TRAVEL_PHASES:
+                state.phase = travel_home_phase
+                state.vanish_started = None
+                charging_progress, charging_tip = 0.0, None
+                if show_myself:
+                    print("[Webcam] App control: back home.")
             elif key == ord("r"):
                 if background is not None:
                     if not show_myself and last_triggered_effect == "goku" and state.phase == "vanished":

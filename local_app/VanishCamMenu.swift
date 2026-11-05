@@ -2,6 +2,8 @@ import AppKit
 import Darwin
 import AVFoundation
 import CryptoKit
+import ImageIO
+import UniformTypeIdentifiers
 
 struct CameraProfile: Codable {
     var mode: String = ""
@@ -76,6 +78,10 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var stopButton: NSButton?
     private var showMyselfButton: NSButton?
     private var effectButtons: [NSButton] = []
+    private var travelButton: NSButton?
+    private var clearDestinationButton: NSButton?
+    private var travelMenuItem: NSMenuItem?
+    private var clearDestinationMenuItem: NSMenuItem?
     private var previewView: NSImageView?
     private var statusLabel: NSTextField?
     private var previewPipe: Pipe?
@@ -107,6 +113,61 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func toggleMenuGestures() {
         gesturesToggle?.state = gesturesToggle?.state == .on ? .off : .on
         callControlsChanged()
+    }
+
+    private var destinationURL: URL {
+        stateDirectory.appendingPathComponent("destination.png")
+    }
+
+    private var hasDestination: Bool {
+        FileManager.default.fileExists(atPath: destinationURL.path)
+    }
+
+    @objc private func chooseDestination() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Instant Transmission destination"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return }
+        do {
+            try saveDestination(from: source)
+            statusLabel?.stringValue = "Destination ready: use Travel or the Goku gesture"
+        } catch {
+            showError("Could not use that image", detail: error.localizedDescription)
+        }
+        updateControls()
+    }
+
+    private func saveDestination(from source: URL) throws {
+        let failure = NSError(domain: "VanishCam", code: 2, userInfo: [NSLocalizedDescriptionKey: "The file is not a readable image."])
+        guard let input = CGImageSourceCreateWithURL(source as CFURL, nil) else { throw failure }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 3840
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(input, 0, options as CFDictionary) else { throw failure }
+        try FileManager.default.createDirectory(at: stateDirectory, withIntermediateDirectories: true)
+        let temporary = stateDirectory.appendingPathComponent("destination-\(UUID().uuidString).png")
+        guard let output = CGImageDestinationCreateWithURL(temporary as CFURL, UTType.png.identifier as CFString, 1, nil) else { throw failure }
+        CGImageDestinationAddImage(output, image, nil)
+        guard CGImageDestinationFinalize(output) else { throw failure }
+        _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: temporary)
+    }
+
+    @objc private func clearDestination() {
+        try? FileManager.default.removeItem(at: destinationURL)
+        statusLabel?.stringValue = "Destination cleared"
+        updateControls()
+    }
+
+    @objc private func triggerTravel() {
+        do {
+            try sendKey("4")
+        } catch {
+            showError("Could not trigger travel", detail: error.localizedDescription)
+        }
     }
 
     @objc private func triggerMenuEffect(_ sender: NSMenuItem) {
@@ -320,6 +381,13 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 effect.tag = key
                 effectMenuItems.append(effect)
             }
+            let travel = menu.addItem(withTitle: "Travel to destination", action: #selector(triggerTravel), keyEquivalent: "")
+            travel.target = self
+            travelMenuItem = travel
+            menu.addItem(withTitle: "Choose destination…", action: #selector(chooseDestination), keyEquivalent: "").target = self
+            let clear = menu.addItem(withTitle: "Clear destination", action: #selector(clearDestination), keyEquivalent: "")
+            clear.target = self
+            clearDestinationMenuItem = clear
             menu.addItem(.separator())
         }
         let controls = menu.addItem(withTitle: "Open controls", action: #selector(openControls), keyEquivalent: "")
@@ -501,6 +569,15 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     effectButtons.append(button)
                 }
                 stack.addArrangedSubview(effects)
+                let travelRow = NSStackView()
+                travelRow.spacing = 12
+                let travel = NSButton(title: "Travel", target: self, action: #selector(triggerTravel))
+                travelButton = travel
+                let choose = NSButton(title: "Choose destination…", target: self, action: #selector(chooseDestination))
+                let clear = NSButton(title: "Clear destination", target: self, action: #selector(clearDestination))
+                clearDestinationButton = clear
+                [travel, choose, clear].forEach { travelRow.addArrangedSubview($0) }
+                stack.addArrangedSubview(travelRow)
             }
             let content = window.contentView!
             content.addSubview(stack)
@@ -548,6 +625,11 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         gesturesMenuItem?.state = gesturesToggle?.state ?? .off
         gesturesMenuItem?.isEnabled = effects && !stopping
         effectMenuItems.forEach { $0.isEnabled = running && !stopping && effects && backgroundReady }
+        let destination = hasDestination
+        travelButton?.isEnabled = running && !stopping && effects && destination
+        travelMenuItem?.isEnabled = running && !stopping && effects && destination
+        clearDestinationButton?.isEnabled = destination
+        clearDestinationMenuItem?.isEnabled = destination
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -605,7 +687,8 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     "--controls-file", stateDirectory.appendingPathComponent("call-controls.json").path,
                     "--reset-background-request", stateDirectory.appendingPathComponent("reset-background").path,
                     "--show-myself-request", stateDirectory.appendingPathComponent("show-myself").path,
-                    "--key-request", keyRequest.path, "--preview-stream"
+                    "--key-request", keyRequest.path, "--preview-stream",
+                    "--destination-file", destinationURL.path
                 ]
                 child.currentDirectoryURL = stateDirectory
                 var environment = ProcessInfo.processInfo.environment
@@ -823,10 +906,13 @@ final class MenuDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         Show myself immediately restores live video without keyboard focus or a Goku cooldown. It does not replace the saved background.
 
+        Travel: choose a destination image, then press Travel or hold the Goku gesture. You stay visible and the room is replaced by the destination; repeat to come home. Travel does not need a saved background.
+
         Use gestures or the effect buttons in the packaged app. In the command-line preview:
         1: dissolve (or hold a peace sign)
         2: Naruto (or bring palms together)
         3: Goku (or two fingers at your temple)
+        4: travel to the chosen destination and back
         R: return; Space: recalibrate; Q/Esc: stop
 
         Stop releases the camera so you can switch cameras or use it directly in Teams. If your saved camera is absent, refresh the list and explicitly select another.

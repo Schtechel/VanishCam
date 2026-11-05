@@ -88,7 +88,7 @@ class MacPreviewTests(unittest.TestCase):
     def test_control_requests_are_validated_and_consumed_once(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "key"
-            for value in ("1", "2", "3", "r", " ", "q"):
+            for value in ("1", "2", "3", "4", "r", " ", "q"):
                 path.write_text(value)
                 self.assertEqual(app.consume_key_request(path), ord(value))
                 self.assertEqual(app.consume_key_request(path), -1)
@@ -211,6 +211,60 @@ class MacPreviewTests(unittest.TestCase):
             self.assertEqual(app.load_framing(background.with_suffix(".framing.json")), app.Framing(2, 1, 0))
             self.assertTrue((app.load_background(background) == 65).all())
             self.assertFalse(np.array_equal(frames[0], frames[1]), "Unconfigured preview must remain live")
+
+    def test_travel_keeps_person_and_swaps_room_without_saved_background(self):
+        with tempfile.TemporaryDirectory(dir=app.APP_DIR.parent / "build") as directory:
+            root = Path(directory)
+            destination_file, key = root / "destination.png", root / "key"
+            cv2.imwrite(str(destination_file), np.full((60, 100, 3), 200, np.uint8))
+            args = SimpleNamespace(
+                camera=0, width=40, height=24, fps=30, fullscreen=False,
+                mode="all", no_mirror=True, gesture_debug=False,
+                preview_stream=True, background_file=root / "background.png",
+                manual_calibration=True, key_request=key, destination_file=destination_file,
+            )
+            clock, index, statuses, frames = [0.0], [-1], [], []
+            times = (0, 0.5, 1.2, 3.5, 3.6, 4.7, 5.0)
+
+            def read():
+                index[0] += 1
+                i = index[0]
+                clock[0] = times[i]
+                if i in (0, 3):
+                    key.write_text("4")
+                elif i == 6:
+                    key.write_text("q")
+                return True, np.full((24, 40, 3), 50, np.uint8)
+
+            mask = np.zeros((24, 40), np.float32)
+            mask[:, :20] = 1.0
+            recognizer = Mock()
+            recognizer.update.return_value = (None, 0, None)
+
+            def receive_preview(stream, frame, status):
+                frames.append(frame.copy())
+                statuses.append(status)
+
+            with ExitStack() as patches:
+                patches.enter_context(patch.object(app, "download_models"))
+                patches.enter_context(patch.object(app, "open_camera", return_value=Mock(read=Mock(side_effect=read))))
+                patches.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), recognizer)))
+                patches.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
+                patches.enter_context(patch.object(app, "VanishSound"))
+                patches.enter_context(patch.object(app, "load_log"))
+                patches.enter_context(patch.object(app, "person_mask", return_value=mask))
+                patches.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))
+                patches.enter_context(patch.dict(app.os.environ, VANISHCAM_PREVIEW_FD="123"))
+                patches.enter_context(patch.object(app.os, "fdopen", return_value=io.BytesIO()))
+                patches.enter_context(patch.object(app, "write_preview", side_effect=receive_preview))
+                with ExitStack() as resources:
+                    self.assertEqual(app.run_camera(args, resources, "all"), 0)
+            self.assertFalse(args.background_file.exists(), "Travel must not capture a background")
+            self.assertTrue((frames[0] == 50).all(), "Before travel the camera stays live")
+            self.assertEqual(statuses[2], "At destination")
+            self.assertTrue((frames[3][:, :20] == 50).all(), "The person stays visible")
+            self.assertTrue((frames[3][:, 20:] == 200).all(), "The room becomes the destination")
+            self.assertTrue((frames[5] == 50).all(), "Coming home restores the live room")
 
 
 if __name__ == "__main__":
