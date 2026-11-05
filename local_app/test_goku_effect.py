@@ -74,6 +74,14 @@ class GokuPoseTests(unittest.TestCase):
         detected, _, _ = goku_pose_from_landmarks([], [face], 640, 480)
         self.assertFalse(detected)
 
+    def test_missing_face_never_uses_screen_position_or_stale_face_box(self):
+        hand = self.make_goku_hand(tip_x=0.50, tip_y=0.21)
+        for box in (None, (0.4, 0.2, 0.6, 0.5)):
+            with self.subTest(box=box):
+                detected, tip, _ = goku_pose_from_landmarks([hand], [], 640, 480, box)
+                self.assertFalse(detected)
+                self.assertIsNone(tip)
+
 
 class GokuRenderTests(unittest.TestCase):
     def setUp(self):

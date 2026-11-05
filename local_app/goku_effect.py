@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 GOKU_TELEPORT_SECONDS = 0.50
-GOKU_HOLD_SECONDS = 0.25
+GOKU_HOLD_SECONDS = 0.9
 TELEPORT_SOUND_PATH = Path(__file__).resolve().parent / "assets" / "teleport.MP3"
 
 # Key face landmark indices for forehead and temples (MediaPipe FaceLandmarker)
@@ -45,7 +45,7 @@ def goku_pose_from_landmarks(
             current_face_box = (fx1, fy1, fx2, fy2)
             face_pts = face
 
-    if not hand_landmarks_list:
+    if not hand_landmarks_list or face_pts is None:
         return False, None, current_face_box
 
     for hand in hand_landmarks_list:
@@ -128,18 +128,6 @@ def goku_pose_from_landmarks(
 
             # Placed directly at forehead / upper temple level
             if min_dist < face_h * 0.38 and tip_y < forehead_y + face_h * 0.38:
-                at_forehead = True
-
-        elif current_face_box is not None:
-            fx1, fy1, fx2, fy2 = current_face_box
-            fw = max(0.05, fx2 - fx1)
-            fh = max(0.05, fy2 - fy1)
-            if (fx1 - 0.25 * fw <= tip_x <= fx2 + 0.25 * fw) and (
-                fy1 - 0.25 * fh <= tip_y <= fy1 + 0.35 * fh
-            ):
-                at_forehead = True
-        else:
-            if tip_y < 0.40:
                 at_forehead = True
 
         if at_forehead:

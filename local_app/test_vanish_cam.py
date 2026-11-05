@@ -6,7 +6,7 @@ import mediapipe as mp
 
 from local_app.vanish_cam import (
     AppState, MultiViewGestureRecognizer, UniversalTracker, recognize_gesture, start_vanish_on_gesture,
-    victory_landmark_score,
+    victory_landmark_score, DeliberateGesture,
 )
 
 
@@ -227,6 +227,13 @@ class UniversalTrackerTests(unittest.TestCase):
             image_format=mp.ImageFormat.SRGB, data=np.zeros((480, 640, 3), dtype=np.uint8)
         )
 
+    def hold_pose(self, tracker, start=10.0):
+        for offset in np.arange(0, 1.01, 0.1):
+            result = tracker.update(self.image, int((start + offset) * 1000), start + offset)
+            if result[0] in ("normal", "naruto", "goku"):
+                return result
+        return result
+
     def test_goku_charging_and_trigger(self):
         face = [SimpleNamespace(x=0.5, y=0.35) for _ in range(468)]
         face[10] = SimpleNamespace(x=0.5, y=0.20)
@@ -261,10 +268,14 @@ class UniversalTrackerTests(unittest.TestCase):
         self.assertIsNotNone(tip)
 
         # After hold duration: triggered!
-        action, prog, tip = tracker.update(self.image, 550, 10.45)
+        for now in (10.4, 10.6, 10.8, 11.0):
+            action, prog, tip = tracker.update(self.image, int(now * 1000), now)
         self.assertEqual(action, "goku")
         self.assertEqual(prog, 1.0)
         self.assertIsNotNone(tip)
+        tracker.reset()
+        for now in np.arange(11.1, 14.0, 0.1):
+            self.assertIsNone(tracker.update(self.image, int(now * 1000), now)[0])
 
     def test_naruto_joined_hands_trigger(self):
         def make_naruto_hand(cx):
@@ -283,11 +294,12 @@ class UniversalTrackerTests(unittest.TestCase):
         ))
 
         tracker = UniversalTracker(mock_gest, mock_face)
-        action, prog, tip = tracker.update(self.image, 100, 10.0)
+        self.assertIsNone(tracker.update(self.image, 100, 10.0)[0])
+        action, prog, tip = self.hold_pose(tracker, 10.1)
         self.assertEqual(action, "naruto")
         self.assertEqual(prog, 1.0)
 
-    def test_normal_v_sign_trigger(self):
+    def test_classifier_without_landmarks_cannot_bypass_hold(self):
         mock_face = SimpleNamespace(detect_for_video=lambda img, ts: SimpleNamespace(face_landmarks=[]))
         mock_gest = SimpleNamespace(recognize_for_video=lambda img, ts: SimpleNamespace(
             hand_landmarks=[], hand_world_landmarks=[],
@@ -295,9 +307,8 @@ class UniversalTrackerTests(unittest.TestCase):
         ))
 
         tracker = UniversalTracker(mock_gest, mock_face)
-        action, score, tip = tracker.update(self.image, 100, 10.0)
-        self.assertEqual(action, "normal")
-        self.assertAlmostEqual(score, 0.92, places=2)
+        action, score, tip = self.hold_pose(tracker)
+        self.assertIsNone(action)
 
     def test_no_gesture_returns_none(self):
         mock_face = SimpleNamespace(detect_for_video=lambda img, ts: SimpleNamespace(face_landmarks=[]))
@@ -329,10 +340,23 @@ class UniversalTrackerTests(unittest.TestCase):
         # First call starts the stillness hold timer
         tracker.update(self.image, 100, 10.0)
         # Calling after the hold duration confirms still V position and triggers vanish
-        action, score, tip = tracker.update(self.image, 400, 10.30)
+        action, score, tip = self.hold_pose(tracker, 10.1)
         self.assertEqual(action, "normal")
         self.assertNotEqual(action, "naruto")
         self.assertGreater(score, 0.62)
+        tracker.reset()
+        for now in np.arange(11.2, 14.0, 0.1):
+            self.assertIsNone(tracker.update(self.image, int(now * 1000), now)[0])
+        mock_gest.recognize_for_video = lambda img, ts: SimpleNamespace(
+            hand_landmarks=[], hand_world_landmarks=[], gestures=[]
+        )
+        for now in np.arange(14.0, 14.7, 0.1):
+            tracker.update(self.image, int(now * 1000), now)
+        mock_gest.recognize_for_video = lambda img, ts: SimpleNamespace(
+            hand_landmarks=[hand_p], hand_world_landmarks=[world_p],
+            gestures=[[SimpleNamespace(category_name="Victory", score=0.92)]],
+        )
+        self.assertEqual(self.hold_pose(tracker, 15.0)[0], "normal")
 
     def test_moving_hand_never_triggers_peace_sign(self):
         # Hand moving across screen (e.g. swept in to perform Naruto) must NOT trigger peace sign
@@ -398,7 +422,7 @@ class UniversalTrackerTests(unittest.TestCase):
         ))
 
         tracker = UniversalTracker(mock_gest, mock_face)
-        action, score, tip = tracker.update(self.image, 100, 10.0)
+        action, score, tip = self.hold_pose(tracker)
         self.assertEqual(action, "naruto")
         self.assertNotEqual(action, "normal")
         self.assertEqual(score, 1.0)
@@ -439,6 +463,57 @@ class UniversalTrackerTests(unittest.TestCase):
         tracker = UniversalTracker(mock_gest, mock_face)
         action, score, tip = tracker.update(self.image, 100, 10.0)
         self.assertNotEqual(action, "naruto")
+
+
+class DeliberateGestureTests(unittest.TestCase):
+    def test_hold_threshold_is_nine_tenths_of_a_second(self):
+        gate = DeliberateGesture()
+        for i in range(9):
+            self.assertFalse(gate.update("goku", (0.4, 0.2), i / 10)[0])
+        self.assertEqual(gate.update("goku", (0.4, 0.2), 0.9), (True, 1.0))
+
+    def test_requires_continuous_release_before_retrigger_including_after_reset(self):
+        gate = DeliberateGesture()
+        for i in range(11):
+            gate.update("goku", (0.4, 0.2), i / 10)
+        gate.reset()
+        for i in range(11, 51):
+            self.assertFalse(gate.update("goku", (0.4, 0.2), i / 10)[0])
+        for now in (5.1, 5.3, 5.6):
+            gate.update(None, None, now)
+        self.assertFalse(gate.latched)
+        triggered = []
+        for i in range(11):
+            triggered.append(gate.update("goku", (0.4, 0.2), 6 + i / 10)[0])
+        self.assertEqual(sum(triggered), 1)
+
+    def test_slow_drift_is_measured_from_hold_origin_not_previous_frame(self):
+        gate = DeliberateGesture()
+        for i in range(40):
+            self.assertFalse(gate.update("normal", (0.2 + i * 0.01, 0.5), i / 10)[0])
+
+    def test_missing_detection_changed_pose_and_long_gap_restart_hold(self):
+        for interruption in ("missing", "different", "gap"):
+            with self.subTest(interruption=interruption):
+                gate = DeliberateGesture()
+                for i in range(9):
+                    gate.update("normal", (0.2, 0.5), i / 10)
+                if interruption == "missing":
+                    gate.update(None, None, 0.85)
+                elif interruption == "different":
+                    gate.update("naruto", (0.2, 0.5), 0.85)
+                now = 2 if interruption == "gap" else 0.9
+                self.assertEqual(gate.update("normal", (0.2, 0.5), now), (False, 0.0))
+
+    def test_detection_dropout_cannot_trigger_or_rearm_by_elapsed_time_alone(self):
+        gate = DeliberateGesture()
+        for i in range(11):
+            gate.update("goku", (0.4, 0.2), i / 10)
+        gate.update(None, None, 1.2)
+        gate.update(None, None, 3.0)
+        self.assertTrue(gate.latched)
+        gate.update("goku", (0.4, 0.2), 3.1)
+        self.assertTrue(gate.latched)
 
 
 if __name__ == "__main__":

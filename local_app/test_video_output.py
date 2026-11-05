@@ -1,4 +1,5 @@
 import argparse
+import io
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -23,7 +24,8 @@ class VirtualCameraTests(unittest.TestCase):
     def test_bgr_format_and_actual_frame_dimensions(self):
         camera = Mock(device="OBS Virtual Camera")
         module = SimpleNamespace(Camera=Mock(return_value=camera), PixelFormat=SimpleNamespace(BGR="BGR"))
-        with patch.dict("sys.modules", pyvirtualcam=module):
+        with patch.object(app, "ensure_obs_virtual_camera_ready"), \
+             patch.dict("sys.modules", pyvirtualcam=module):
             self.assertIs(app.open_virtual_camera(arguments(), 640, 480), camera)
         module.Camera.assert_called_once_with(
             width=640, height=480, fps=30.0, fmt="BGR", backend=None, device=None,
@@ -32,7 +34,8 @@ class VirtualCameraTests(unittest.TestCase):
     def test_unavailable_driver_auto_falls_back_but_explicit_mode_fails(self):
         module = SimpleNamespace(Camera=Mock(side_effect=RuntimeError("driver missing")),
                                  PixelFormat=SimpleNamespace(BGR="BGR"))
-        with patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print"):
+        with patch.object(app, "ensure_obs_virtual_camera_ready"), \
+             patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print"):
             self.assertIsNone(app.open_virtual_camera(arguments(), 640, 480))
             for options in (dict(virtual_camera=True), dict(virtual_backend="obs")):
                 with self.assertRaisesRegex(RuntimeError, "driver missing"):
@@ -62,7 +65,7 @@ class VirtualCameraTests(unittest.TestCase):
 
 
 class VideoLoopTests(unittest.TestCase):
-    def run_mock_video(self, send_error=None, gesture=("No_Hand", 0.0)):
+    def run_mock_video(self, send_error=None, gesture=("No_Hand", 0.0), native=False):
         capture = Mock()
         frames = [np.full((24, 40, 3), color, np.uint8) for color in (10, 40, 80, 120, 160)]
         capture.read.side_effect = [(True, frame) for frame in frames]
@@ -71,7 +74,7 @@ class VideoLoopTests(unittest.TestCase):
         camera.send.side_effect = send_error
         displayed = []
         with ExitStack() as mocks:
-            mocks.enter_context(patch.object(app, "parse_args", return_value=arguments()))
+            mocks.enter_context(patch.object(app, "parse_args", return_value=arguments(preview_stream=native)))
             mocks.enter_context(patch.object(app, "download_models"))
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(segmenter, recognizer)))
@@ -80,12 +83,17 @@ class VideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "recognize_gesture", return_value=gesture))
             times = (0, 0, 0.1, 4.1, 4.3, 4.35, 5.0, 5.02, 8.2, 8.23)
             mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=times))
-            mocks.enter_context(patch.object(app.cv2, "namedWindow"))
+            window = mocks.enter_context(patch.object(app.cv2, "namedWindow"))
             mocks.enter_context(patch.object(app.cv2, "resizeWindow"))
             destroy = mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
             mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: displayed.append(frame.copy())))
             keys = (0, 0, ord("v") if gesture[0] != "Victory" else 0, 0, ord("q"))
-            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            keyboard = mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            if native:
+                mocks.enter_context(patch.dict(app.os.environ, VANISHCAM_PREVIEW_FD="123"))
+                mocks.enter_context(patch.object(app.os, "fdopen", return_value=io.BytesIO()))
+                mocks.enter_context(patch.object(app, "write_preview", side_effect=lambda stream, frame, status: displayed.append(frame.copy())))
+                mocks.enter_context(patch.object(app, "consume_key_request", side_effect=keys))
             mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("Overlay forbidden")))
             mocks.enter_context(patch("builtins.print"))
             if send_error is None:
@@ -99,7 +107,12 @@ class VideoLoopTests(unittest.TestCase):
             segmenter.close.assert_called_once()
             recognizer.close.assert_called_once()
             camera.close.assert_called_once()
-            destroy.assert_called_once()
+            if native:
+                destroy.assert_not_called()
+                window.assert_not_called()
+                keyboard.assert_not_called()
+            else:
+                destroy.assert_called_once()
         return frames, camera, displayed
 
     def test_preview_and_virtual_output_are_clean_in_all_phases(self):
@@ -120,6 +133,12 @@ class VideoLoopTests(unittest.TestCase):
 
     def test_all_devices_close_on_send_error(self):
         self.run_mock_video(send_error=RuntimeError("send failed"))
+
+    def test_native_preview_matches_obs_without_creating_python_window(self):
+        _, camera, displayed = self.run_mock_video(native=True)
+        self.assertEqual(len(displayed), 5)
+        for sent, preview in zip(camera.send.call_args_list, displayed):
+            np.testing.assert_array_equal(sent.args[0], preview)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,14 @@ VanishCam is an AI-powered real-time webcam effects suite that runs entirely loc
 
 ## Getting Started
 
+### macOS with Camo Studio
+
+From the repository root, run `./VanishCam.command` (or double-click it in Finder). The command creates an isolated `.venv-local` environment and installs the pinned dependencies on first launch. It selects the AVFoundation device named **Camo Camera**, disables mirroring to preserve the Camo orientation, and requires the **OBS Virtual Camera** backend. The Mac launcher saves one local calibration image in `.local-state/background.png`, ignored by Git, and reuses it on future starts. Use **Reset background** in the menu-bar app or **Space** in the preview to capture a replacement; step out for four seconds. Reset when the camera position, lighting, or room changes. A changed capture resolution triggers recalibration automatically. No video is recorded or uploaded.
+
+Before first use, install OBS Studio, start and stop **OBS Virtual Camera** once in OBS, and then quit OBS so its macOS camera extension is registered. If System Settings reports the extension is waiting for approval, approve it there and restart if prompted. Keep Camo Studio running with the Logitech camera selected. If macOS requests camera access, allow it for the app launching the command. Select **OBS Virtual Camera** in Teams yourself; no Camo or Teams setting is changed here.
+
+The launcher fails rather than falling back to FaceTime or another device if **Camo Camera** is not found. Quit VanishCam with `Q` or `ESC`, and do not stream from OBS while VanishCam is sending frames.
+
 ### Quick Start (Windows)
 
 Simply run the batch launchers from the root directory:
@@ -84,6 +92,7 @@ python local_app/vanish_cam.py [OPTIONS]
 
 Options:
   --camera INT              Webcam index (default: 0)
+  --camera-name NAME        Select an AVFoundation camera by name (macOS)
   --width INT               Video capture width (default: 960)
   --height INT              Video capture height (default: 540)
   --fps FLOAT               Max FPS for virtual camera output (default: 30)
@@ -107,3 +116,13 @@ cd local_app
 BUILD_WINDOWS.bat
 ```
 The compiled binary will be placed in `local_app\dist\VanishCam.exe`.
+# Standalone macOS app
+
+From the repository root, run `./Build-macOS.command` to produce
+`dist/macos/VanishCam.app` for Apple silicon. It embeds its runtime, models,
+audio, and FFmpeg dependencies; there is no Terminal or external Python app at
+runtime. It captures Logitech or the Mac camera directly, or **Camo Camera**
+when you want Camo Studio's adjustments. Camo must be running only for that
+input. An enabled OBS Virtual Camera extension is required for output.
+See the root README's macOS section for controls, private background
+storage, and the development-only launchers.

@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import platform
+import re
+import select
+import shutil
+import struct
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,8 +76,10 @@ CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
 VANISH_SECONDS = 3.6
 GESTURE_INTERVAL_SECONDS = 0.14
-PEACE_HOLD_SECONDS = 0.25
-PEACE_MAX_DRIFT = 0.040
+GESTURE_HOLD_SECONDS = GOKU_HOLD_SECONDS
+GESTURE_RELEASE_SECONDS = 0.4
+GESTURE_MAX_SAMPLE_GAP = 0.35
+GESTURE_MAX_DRIFT = 0.035
 
 
 @dataclass
@@ -92,7 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="VanishCam: All-In-One Universal Meme Camera (Goku, Naruto, Normal Vanish)."
     )
-    parser.add_argument("--camera", type=int, default=0, help="Webcam index")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam device index")
+    parser.add_argument(
+        "--camera-name",
+        help="Select an AVFoundation camera by exact device name (macOS only)",
+    )
     parser.add_argument("--width", type=int, default=960, help="Video width")
     parser.add_argument("--height", type=int, default=540, help="Video height")
     parser.add_argument(
@@ -124,7 +138,244 @@ def parse_args() -> argparse.Namespace:
         help="Print gesture recognition status to the terminal (no text on video)",
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--background-file", type=Path, help="Reuse a locally saved calibration image")
+    parser.add_argument("--reset-background-request", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--show-myself-request", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--key-request", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--preview-stream", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--framing-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--manual-calibration", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--capture-size", help="Native camera resolution, e.g. 1920x1080")
+    parser.add_argument("--controls-file", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+@dataclass(frozen=True)
+class Framing:
+    zoom: float = 1.0
+    horizontal: float = 0.0
+    vertical: float = 0.0
+
+
+def load_call_controls(path: Path | None) -> tuple[bool, bool]:
+    if path is None:
+        return True, True
+    try:
+        data = json.loads(path.read_text())
+        if set(data) != {"effects", "gestures"} or any(type(value) is not bool for value in data.values()):
+            raise ValueError("Expected boolean effects and gestures controls.")
+        return data["effects"], data["gestures"] and data["effects"]
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeError(f"Cannot read call controls: {error}") from error
+
+
+def load_framing(path: Path | None) -> Framing:
+    if path is None:
+        return Framing()
+    try:
+        data = json.loads(path.read_text())
+        framing = Framing(**data)
+        values = (framing.zoom, framing.horizontal, framing.vertical)
+        if not all(isinstance(value, (int, float)) and np.isfinite(value) for value in values):
+            raise ValueError("Framing values must be finite numbers.")
+        if not 1 <= framing.zoom <= 3 or not -1 <= framing.horizontal <= 1 or not -1 <= framing.vertical <= 1:
+            raise ValueError("Zoom must be 1–3 and position must be -1–1.")
+        return framing
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeError(f"Cannot read camera framing: {error}") from error
+
+
+def apply_framing(frame: np.ndarray, framing: Framing, output_size: tuple[int, int] | None = None) -> np.ndarray:
+    if framing.zoom == 1 and output_size is None:
+        return frame
+    height, width = frame.shape[:2]
+    aspect = output_size[0] / output_size[1] if output_size else width / height
+    base_width = min(width, height * aspect)
+    base_height = min(height, width / aspect)
+    crop_width = max(1, round(base_width / framing.zoom))
+    crop_height = max(1, round(base_height / framing.zoom))
+    x = round((width - crop_width) * (framing.horizontal + 1) / 2)
+    y = round((height - crop_height) * (framing.vertical + 1) / 2)
+    return cv2.resize(frame[y:y + crop_height, x:x + crop_width], output_size or (width, height))
+
+
+def write_preview(stream, frame: np.ndarray, status: str) -> None:
+    """Send an in-memory preview packet to the native app, never to disk."""
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        raise RuntimeError("Cannot encode the app preview.")
+    payload = status.encode("utf-8") + b"\0" + encoded.tobytes()
+    stream.write(struct.pack(">I", len(payload)) + payload)
+    stream.flush()
+
+
+def consume_key_request(path: Path | None) -> int:
+    if path is None or not path.exists():
+        return -1
+    value = path.read_text()
+    path.unlink()
+    if value not in ("1", "2", "3", "r", " ", "q"):
+        raise RuntimeError("Invalid app control request.")
+    return ord(value)
+
+
+def load_background(path: Path | None) -> np.ndarray | None:
+    if path is None or not path.exists():
+        return None
+    background = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if background is None:
+        raise RuntimeError(f"Cannot read saved background: {path}. Reset the background and retry.")
+    return background
+
+
+def save_background(path: Path | None, background: np.ndarray) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.stem + ".part.png")
+    try:
+        if not cv2.imwrite(str(temporary), background):
+            raise RuntimeError(f"Cannot save background: {path}")
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"[Webcam] Background saved locally: {path}")
+
+
+def consume_background_reset(path: Path | None) -> bool:
+    if path is None or not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+class NamedMacCamera:
+    """Continuously drain named camera input, keeping only the newest frame."""
+
+    def __init__(self, name: str, width: int, height: int, fps: float, capture_size: str | None = None):
+        if width <= 0 or height <= 0:
+            raise RuntimeError("Camera width and height must be positive.")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("FFmpeg is required for named macOS camera input.")
+        self.width, self.height = width, height
+        self.name = name
+        self.errors = tempfile.TemporaryFile()
+        self.process = None
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._frame = None
+        self._error = None
+        self._reader = None
+        if capture_size is not None and not re.fullmatch(r"[1-9]\d*x[1-9]\d*", capture_size):
+            self.errors.close()
+            raise RuntimeError("Invalid native capture resolution.")
+        native_options = ["-video_size", capture_size] if capture_size else []
+        try:
+            self.process = subprocess.Popen(
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "avfoundation", "-framerate", str(fps),
+                 *native_options,
+                 "-i", f"{name}:none", "-an",
+                 "-vf", f"scale={width}:{height}",
+                 "-pix_fmt", "bgr24", "-fps_mode", "passthrough",
+                 "-f", "rawvideo", "pipe:1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=self.errors, bufsize=0,
+            )
+            self._reader = threading.Thread(target=self._read_frames, name="VanishCam capture", daemon=True)
+            self._reader.start()
+        except OSError:
+            self.errors.close()
+            raise
+
+    def set(self, property_id: int, value: float) -> bool:
+        return False  # Capture settings are passed to FFmpeg at process creation.
+
+    def read(self) -> tuple[bool, np.ndarray]:
+        deadline = time.monotonic() + 15
+        with self._condition:
+            while self._frame is None and self._error is None and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"Camera '{self.name}' did not provide a new frame within 15 seconds.")
+                self._condition.wait(timeout=remaining)
+            if self._error is not None:
+                raise self._error
+            if self._stop.is_set():
+                raise RuntimeError(f"Camera '{self.name}' capture is closed.")
+            frame, self._frame = self._frame, None
+            return True, frame
+
+    def _read_frames(self) -> None:
+        try:
+            while not self._stop.is_set():
+                frame = self._read_frame()
+                if frame is None:
+                    return
+                with self._condition:
+                    self._frame = frame
+                    self._condition.notify_all()
+        except (OSError, RuntimeError, ValueError) as error:
+            with self._condition:
+                self._error = error
+                self._condition.notify_all()
+
+    def _read_frame(self) -> np.ndarray | None:
+        if self.process is None or self.process.stdout is None:
+            raise RuntimeError(f"Camera '{self.name}' capture is closed.")
+        descriptor = self.process.stdout.fileno()
+        remaining = self.width * self.height * 3
+        chunks = []
+        deadline = time.monotonic() + 15
+        while remaining:
+            if self._stop.is_set():
+                return None
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                self.raise_capture_error(f"Camera '{self.name}' did not provide a frame within 15 seconds.")
+            if not select.select([descriptor], [], [], min(wait, 0.25))[0]:
+                continue
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                self.raise_capture_error(f"Camera '{self.name}' capture stopped.")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        frame = np.frombuffer(b"".join(chunks), dtype=np.uint8)
+        return frame.reshape(self.height, self.width, 3)
+
+    def raise_capture_error(self, message: str) -> None:
+        self.errors.seek(0)
+        details = self.errors.read().decode(errors="replace")[-2000:].strip()
+        lid_hint = " Open the MacBook lid to use its built-in camera." if any(
+            word in self.name.lower() for word in ("facetime", "built-in")
+        ) else ""
+        raise RuntimeError(
+            f"{message} Check that the selected camera is connected and not held by another app. Allow camera "
+            f"access for the launching app in macOS Settings.{lid_hint} FFmpeg: {details or 'No diagnostic output.'}"
+        )
+
+    def release(self) -> None:
+        if self.process is None:
+            return
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        process = self.process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if self._reader is not None:
+            self._reader.join()
+        self.process = None
+        if process.stdout is not None:
+            process.stdout.close()
+        self.errors.close()
 
 
 def choose_mode() -> str | None:
@@ -183,6 +434,8 @@ def choose_mode() -> str | None:
 def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
     if args.virtual_camera is False:
         return None
+    if platform.system() == "Darwin" and args.virtual_backend in (None, "obs"):
+        ensure_obs_virtual_camera_ready()
     try:
         import pyvirtualcam
 
@@ -205,6 +458,44 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
         return None
     print(f"[Webcam] Virtual output active: {camera.device} ({width}x{height}, {args.fps:g} max FPS)")
     return camera
+
+
+def ensure_obs_virtual_camera_ready() -> None:
+    systemextensionsctl = shutil.which("systemextensionsctl")
+    if systemextensionsctl is None:
+        raise RuntimeError(
+            "Cannot verify the OBS Virtual Camera extension because systemextensionsctl "
+            "was not found."
+        )
+    try:
+        result = subprocess.run(
+            [systemextensionsctl, "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Timed out while checking the OBS Virtual Camera extension.") from error
+    extension_lines = [
+        line for line in f"{result.stdout}\n{result.stderr}".splitlines()
+        if "com.obsproject.obs-studio.mac-camera-extension" in line
+    ]
+    if not extension_lines:
+        raise RuntimeError(
+            "OBS Virtual Camera is not registered with macOS. Start and stop it once in OBS."
+        )
+    status = extension_lines[0].casefold()
+    if "waiting for user" in status:
+        raise RuntimeError(
+            "The OBS Virtual Camera extension is waiting for macOS approval. "
+            "Approve it in System Settings > Privacy & Security, and restart if prompted."
+        )
+    if "activated" not in status or "enabled" not in status:
+        raise RuntimeError(
+            "The OBS Virtual Camera extension is not active. Approve or enable it in "
+            "System Settings > Privacy & Security, then restart if prompted."
+        )
 
 
 def send_virtual_frame(camera, frame: np.ndarray) -> None:
@@ -253,10 +544,17 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
         if not capture.isOpened():
             capture.release()
             capture = cv2.VideoCapture(index)
+    elif platform.system() == "Darwin":
+        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     else:
         capture = cv2.VideoCapture(index)
 
     if not capture.isOpened():
+        if platform.system() == "Darwin":
+            raise RuntimeError(
+                f"Unable to open AVFoundation camera index {index}. "
+                "Check macOS camera access in System Settings > Privacy & Security > Camera."
+            )
         raise RuntimeError(
             f"Webcam {index} unavailable. Close other applications or try --camera 1."
         )
@@ -265,6 +563,66 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return capture
+
+
+def list_avfoundation_cameras() -> list[tuple[int, str]]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "Cannot select a camera by name because ffmpeg was not found on PATH. "
+            "Install ffmpeg or use --camera with a verified device index."
+        )
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Timed out while listing AVFoundation cameras with ffmpeg.") from error
+    output = f"{result.stderr}\n{result.stdout}"
+    cameras: list[tuple[int, str]] = []
+    in_video_devices = False
+    for line in output.splitlines():
+        if "AVFoundation video devices:" in line:
+            in_video_devices = True
+            continue
+        if "AVFoundation audio devices:" in line:
+            break
+        if in_video_devices:
+            match = re.search(r"\[(\d+)\]\s+(.+)$", line)
+            if match:
+                cameras.append((int(match.group(1)), match.group(2).strip()))
+    if not cameras:
+        detail = output.strip().splitlines()
+        detail = "\n".join(detail[-6:]) if detail else "ffmpeg returned no device list."
+        raise RuntimeError(f"Unable to enumerate AVFoundation cameras:\n{detail}")
+    return cameras
+
+
+def resolve_camera_name(name: str) -> int:
+    if platform.system() != "Darwin":
+        raise RuntimeError("--camera-name is supported only on macOS.")
+    cameras = list_avfoundation_cameras()
+    matches = [
+        (index, device_name) for index, device_name in cameras
+        if device_name.casefold() == name.casefold()
+    ]
+    if len(matches) != 1:
+        available = ", ".join(device_name for _, device_name in cameras)
+        if not matches:
+            raise RuntimeError(
+                f"Camera '{name}' was not found. AVFoundation devices: {available}. "
+                "Start Camo Studio and confirm its Camo Camera output is available."
+            )
+        raise RuntimeError(
+            f"Camera name '{name}' is ambiguous in AVFoundation: {available}."
+        )
+    index, device_name = matches[0]
+    print(f"[Webcam] Selected '{device_name}' at AVFoundation device index {index}.")
+    return index
 
 
 def create_tasks(mode: str = "all") -> tuple[vision.ImageSegmenter, Any]:
@@ -283,9 +641,9 @@ def create_tasks(mode: str = "all") -> tuple[vision.ImageSegmenter, Any]:
             base_options=python.BaseOptions(model_asset_path=str(GESTURE_MODEL)),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
-            min_hand_detection_confidence=0.20,
-            min_hand_presence_confidence=0.20,
-            min_tracking_confidence=0.35,
+            min_hand_detection_confidence=0.50,
+            min_hand_presence_confidence=0.50,
+            min_tracking_confidence=0.50,
         )
         face_options = vision.FaceLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(FACE_MODEL)),
@@ -299,21 +657,14 @@ def create_tasks(mode: str = "all") -> tuple[vision.ImageSegmenter, Any]:
         try:
             gesture_task = vision.GestureRecognizer.create_from_options(gesture_options)
             try:
-                alt_task = vision.GestureRecognizer.create_from_options(
-                    replace(gesture_options, running_mode=vision.RunningMode.IMAGE)
-                )
-                try:
-                    face_task = vision.FaceLandmarker.create_from_options(face_options)
-                except Exception:
-                    alt_task.close()
-                    raise
+                face_task = vision.FaceLandmarker.create_from_options(face_options)
             except Exception:
                 gesture_task.close()
                 raise
         except Exception:
             segmenter.close()
             raise
-        return segmenter, UniversalTracker(gesture_task, face_task, alt_task)
+        return segmenter, UniversalTracker(gesture_task, face_task)
     elif mode == "naruto":
         if not HAND_MODEL.is_file():
             raise RuntimeError(f"Hand model not found: {HAND_MODEL}")
@@ -702,6 +1053,59 @@ class MultiViewHandLandmarker:
             self.alternate.close()
 
 
+class DeliberateGesture:
+    """Require a stable hold and a neutral release between activations."""
+
+    def __init__(self):
+        self.candidate: str | None = None
+        self.anchor: tuple[float, ...] | None = None
+        self.started: float | None = None
+        self.last_sample: float | None = None
+        self.latched = False
+        self.release_started: float | None = None
+
+    def reset(self) -> None:
+        # A mode change or effect cooldown is not evidence that the hand was released.
+        self.candidate = None
+        self.anchor = None
+        self.started = None
+        self.last_sample = None
+        self.release_started = None
+
+    def update(
+        self, candidate: str | None, anchor: tuple[float, ...] | None, now: float
+    ) -> tuple[bool, float]:
+        continuous = self.last_sample is not None and 0 <= now - self.last_sample <= GESTURE_MAX_SAMPLE_GAP
+        self.last_sample = now
+        if self.latched:
+            if candidate is not None:
+                self.release_started = None
+            elif self.release_started is None or not continuous:
+                self.release_started = now
+            elif now - self.release_started >= GESTURE_RELEASE_SECONDS:
+                self.latched = False
+                self.release_started = None
+            return False, 0.0
+        if candidate is None or anchor is None:
+            self.candidate = None
+            self.started = None
+            self.anchor = None
+            return False, 0.0
+        moved = self.anchor is not None and (
+            len(anchor) != len(self.anchor)
+            or any(math.hypot(anchor[i] - self.anchor[i], anchor[i + 1] - self.anchor[i + 1])
+                   > GESTURE_MAX_DRIFT for i in range(0, len(anchor), 2))
+        )
+        if candidate != self.candidate or not continuous or moved or self.started is None:
+            self.candidate, self.anchor, self.started = candidate, anchor, now
+        progress = min(1.0, (now - self.started) / GESTURE_HOLD_SECONDS)
+        if progress >= 1.0:
+            self.latched = True
+            self.reset()
+            return True, 1.0
+        return False, progress
+
+
 class GokuTracker:
     """Track 2-finger temple/forehead pose with hold duration for Goku Instant Transmission."""
 
@@ -709,9 +1113,7 @@ class GokuTracker:
         self.hand_landmarker = hand_landmarker
         self.face_landmarker = face_landmarker
         self.last_face_box: tuple[float, float, float, float] | None = None
-        self.hold_started: float | None = None
-        self.last_detected_time: float = 0.0
-        self.last_tip_pos: tuple[int, int] | None = None
+        self.hold = DeliberateGesture()
 
     def update(
         self, image: mp.Image, timestamp_ms: int, now: float
@@ -726,33 +1128,12 @@ class GokuTracker:
             image.height,
             self.last_face_box,
         )
-        if tip_pos is not None:
-            self.last_tip_pos = tip_pos
-
-        if detected:
-            self.last_detected_time = now
-            if self.hold_started is None:
-                self.hold_started = now
-            duration = now - self.hold_started
-            progress = min(1.0, duration / GOKU_HOLD_SECONDS)
-            triggered = duration >= GOKU_HOLD_SECONDS
-            if triggered:
-                self.hold_started = None
-            return triggered, progress, (tip_pos or self.last_tip_pos)
-        else:
-            if self.hold_started is not None and (now - self.last_detected_time) < 0.22:
-                duration = now - self.hold_started
-                progress = min(1.0, duration / GOKU_HOLD_SECONDS)
-                triggered = duration >= GOKU_HOLD_SECONDS
-                if triggered:
-                    self.hold_started = None
-                return triggered, progress, self.last_tip_pos
-            self.hold_started = None
-            return False, 0.0, None
+        anchor = (tip_pos[0] / image.width, tip_pos[1] / image.height) if detected and tip_pos else None
+        triggered, progress = self.hold.update("goku" if detected else None, anchor, now)
+        return triggered, progress, tip_pos if detected else None
 
     def reset(self) -> None:
-        self.hold_started = None
-        self.last_detected_time = 0.0
+        self.hold.reset()
 
     def close(self) -> None:
         try:
@@ -774,14 +1155,8 @@ class UniversalTracker:
         self.face_landmarker = face_landmarker
         self.alternate_recognizer = alternate_recognizer
         self.last_face_box: tuple[float, float, float, float] | None = None
-        self.hold_started: float | None = None
-        self.last_detected_time: float = 0.0
-        self.last_tip_pos: tuple[int, int] | None = None
         self.last_hand_count: int = 0
-        self.next_naruto_retry_ms: int = 0
-        self.peace_hold_started: float | None = None
-        self.last_peace_time: float = 0.0
-        self.last_peace_pos: tuple[float, float] | None = None
+        self.hold = DeliberateGesture()
 
     def update(
         self, image: mp.Image, timestamp_ms: int, now: float
@@ -790,7 +1165,6 @@ class UniversalTracker:
         hand_result = self.gesture_recognizer.recognize_for_video(image, timestamp_ms)
         self.last_hand_count = len(hand_result.hand_landmarks)
 
-        # 1. Goku Instant Transmission (2 joined fingers touching forehead/temple)
         goku_detected, tip_pos, self.last_face_box = goku_pose_from_landmarks(
             hand_result.hand_landmarks,
             face_result.face_landmarks,
@@ -798,123 +1172,32 @@ class UniversalTracker:
             image.height,
             self.last_face_box,
         )
-        if tip_pos is not None:
-            self.last_tip_pos = tip_pos
+        candidate = None
+        anchor = None
+        score = 1.0
+        if goku_detected and tip_pos is not None:
+            candidate = "goku"
+            anchor = (tip_pos[0] / image.width, tip_pos[1] / image.height)
+        elif self.last_hand_count == 1:
+            name, score = classify_gesture_result(hand_result, image)
+            if name == "Victory" and score >= 0.75:
+                candidate = "normal"
+                hand = hand_result.hand_landmarks[0]
+                anchor = (hand[5].x, hand[5].y, hand[8].x, hand[8].y, hand[12].x, hand[12].y)
+        elif joined_hands_from_landmarks(hand_result.hand_landmarks, image.width, image.height):
+            candidate = "naruto"
+            hands = sorted(hand_result.hand_landmarks, key=lambda hand: hand[0].x)
+            anchor = tuple(value for hand in hands for i in (0, 8, 12) for value in (hand[i].x, hand[i].y))
 
-        if goku_detected:
-            self.last_detected_time = now
-            if self.hold_started is None:
-                self.hold_started = now
-            duration = now - self.hold_started
-            progress = min(1.0, duration / GOKU_HOLD_SECONDS)
-            if duration >= GOKU_HOLD_SECONDS:
-                self.hold_started = None
-                return "goku", 1.0, (tip_pos or self.last_tip_pos)
-            return "goku_charging", progress, (tip_pos or self.last_tip_pos)
-        else:
-            if self.hold_started is not None and (now - self.last_detected_time) < 0.22:
-                duration = now - self.hold_started
-                progress = min(1.0, duration / GOKU_HOLD_SECONDS)
-                if duration >= GOKU_HOLD_SECONDS:
-                    self.hold_started = None
-                    return "goku", 1.0, self.last_tip_pos
-                return "goku_charging", progress, self.last_tip_pos
-            self.hold_started = None
-
-        # 2. Check Peace Sign (Normal Vanish: V-sign)
-        is_peace = False
-        peace_score = 0.0
-
-        # Peace sign strictly requires exactly 1 hand held STILL in V position
-        if len(hand_result.hand_landmarks) == 1:
-            peace_name, p_score = classify_gesture_result(hand_result, image)
-            if peace_name == "Victory" and p_score >= 0.62:
-                # Track hand anchor (knuckle 5 MCP) to ensure hand is still
-                hand_pts = hand_result.hand_landmarks[0]
-                curr_pos = (hand_pts[5].x, hand_pts[5].y)
-
-                is_still = True
-                if self.last_peace_pos is not None:
-                    drift = math.hypot(curr_pos[0] - self.last_peace_pos[0],
-                                       curr_pos[1] - self.last_peace_pos[1])
-                    if drift > PEACE_MAX_DRIFT:
-                        is_still = False
-
-                if is_still:
-                    self.last_peace_time = now
-                    self.last_peace_pos = curr_pos
-                    if self.peace_hold_started is None:
-                        self.peace_hold_started = now
-                    hold_duration = now - self.peace_hold_started
-                    if hold_duration >= PEACE_HOLD_SECONDS:
-                        is_peace = True
-                        peace_score = p_score
-                        self.peace_hold_started = None
-                        self.last_peace_pos = None
-                else:
-                    # Hand moving too fast (e.g. sweeping in to perform Naruto), reset hold timer
-                    self.peace_hold_started = now
-                    self.last_peace_pos = curr_pos
-            else:
-                if self.peace_hold_started is not None and (now - self.last_peace_time) > 0.12:
-                    self.peace_hold_started = None
-                    self.last_peace_pos = None
-        elif len(hand_result.hand_landmarks) == 0 and hand_result.gestures:
-            # Mock / classifier-only test case without landmarks
-            peace_name, p_score = classify_gesture_result(hand_result, image)
-            if peace_name == "Victory" and p_score >= 0.62:
-                is_peace = True
-                peace_score = p_score
-        else:
-            # 2 or more hands in frame: user is performing Naruto or moving hands
-            self.peace_hold_started = None
-            self.last_peace_pos = None
-
-        # 3. Naruto Substitution Jutsu (2 hands with palms joined together)
-        naruto_detected = joined_hands_from_landmarks(
-            hand_result.hand_landmarks,
-            image.width,
-            image.height,
-            is_peace_sign=is_peace,
-        )
-        if not naruto_detected and not is_peace and self.alternate_recognizer is not None and timestamp_ms >= self.next_naruto_retry_ms:
-            rgb = image.numpy_view()
-            h, w = rgb.shape[:2]
-            center_crop = rgb[int(h * 0.18):, int(w * 0.15):int(w * 0.85)]
-            center_img = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=np.ascontiguousarray(center_crop),
-            )
-            alt_result = self.alternate_recognizer.recognize(center_img)
-            alt_name, alt_score = classify_gesture_result(alt_result, center_img)
-            alt_is_peace = (alt_name == "Victory" and alt_score >= 0.62)
-            if not alt_is_peace and joined_hands_from_landmarks(
-                alt_result.hand_landmarks,
-                center_img.width,
-                center_img.height,
-                is_peace_sign=alt_is_peace,
-            ):
-                naruto_detected = True
-                self.next_naruto_retry_ms = timestamp_ms + 100
-            else:
-                self.next_naruto_retry_ms = timestamp_ms + 120
-
-        # Peace sign strictly triggers normal dissolve vanish only
-        if is_peace:
-            return "normal", peace_score, None
-
-        # Naruto move strictly triggers log conversion substitution only
-        if naruto_detected:
-            return "naruto", 1.0, None
-
+        triggered, progress = self.hold.update(candidate, anchor, now)
+        if triggered:
+            return candidate, score, tip_pos if candidate == "goku" else None
+        if candidate == "goku" and not self.hold.latched:
+            return "goku_charging", progress, tip_pos
         return None, 0.0, None
 
     def reset(self) -> None:
-        self.hold_started = None
-        self.last_detected_time = 0.0
-        self.peace_hold_started = None
-        self.last_peace_time = 0.0
-        self.last_peace_pos = None
+        self.hold.reset()
 
     def close(self) -> None:
         try:
@@ -993,7 +1276,16 @@ def run() -> int:
 
 def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int:
     download_models(mode)
-    capture = open_camera(args.camera, args.width, args.height)
+    camera_name = getattr(args, "camera_name", None)
+    camera_index = resolve_camera_name(camera_name) if camera_name else args.camera
+    capture_size = getattr(args, "capture_size", None)
+    if capture_size is not None and not re.fullmatch(r"[1-9]\d*x[1-9]\d*", capture_size):
+        raise RuntimeError("Invalid native capture resolution.")
+    native_width, native_height = map(int, capture_size.split("x")) if capture_size else (args.width, args.height)
+    capture = (
+        NamedMacCamera(camera_name, native_width, native_height, args.fps, capture_size)
+        if camera_name else open_camera(camera_index, args.width, args.height)
+    )
     resources.callback(capture.release)
     capture.set(cv2.CAP_PROP_FPS, args.fps)
     segmenter, recognizer = create_tasks(mode)
@@ -1027,17 +1319,43 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         elif vanish_sound is not None:
             vanish_sound.play()
 
-    resources.callback(cv2.destroyAllWindows)
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
+    preview_stream = None
+    if getattr(args, "preview_stream", False):
+        descriptor = os.environ.get("VANISHCAM_PREVIEW_FD")
+        if descriptor is None:
+            raise RuntimeError("The native app preview pipe is missing.")
+        preview_stream = resources.enter_context(os.fdopen(int(descriptor), "wb"))
+    else:
+        resources.callback(cv2.destroyAllWindows)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
 
     state = AppState(
         calibration_started=time.perf_counter(), fullscreen=args.fullscreen
     )
-    if state.fullscreen:
+    if state.fullscreen and preview_stream is None:
         set_fullscreen(True)
 
-    background: np.ndarray | None = None
+    background_file = getattr(args, "background_file", None)
+    framing_file = getattr(args, "framing_file", None)
+    framing = load_framing(framing_file)
+    background_framing = background_file.with_suffix(".framing.json") if background_file and framing_file else None
+    reset_request = getattr(args, "reset_background_request", None)
+    show_myself_request = getattr(args, "show_myself_request", None)
+    consume_background_reset(show_myself_request)
+    reset_at_start = consume_background_reset(reset_request)
+    if getattr(args, "manual_calibration", False):
+        reset_at_start = False  # A stale request must never capture a background on launch.
+    background = None if reset_at_start else load_background(background_file)
+    if background is not None and background_framing is not None:
+        if not background_framing.exists() or load_framing(background_framing) != framing:
+            background = None
+    if background is not None:
+        state.phase = "ready"
+    elif getattr(args, "manual_calibration", False) and not reset_at_start:
+        state.phase = "unconfigured"
+    controls_file = getattr(args, "controls_file", None)
+    effects_enabled, gestures_enabled = load_call_controls(controls_file)
     background_samples: list[np.ndarray] = []
     last_mask: np.ndarray | None = None
     last_mask_at = float("-inf")
@@ -1049,14 +1367,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     virtual_camera = None
     virtual_camera_initialized = False
     calibration_remaining = None
+    background_saved_at = float("-inf")
     last_gesture_report = 0.0
     charging_tip: tuple[int, int] | None = None
     charging_progress = 0.0
-    current_camera_index = args.camera
+    current_camera_index = camera_index
     last_triggered_effect = "goku" if mode in ("all", "goku") else mode
     goku_reappeared_at = 0.0
     started = time.perf_counter()
-    print("[Webcam] Step out of frame for 4 seconds to capture background.")
+    if background is None:
+        if state.phase == "unconfigured":
+            print("[Webcam] Live camera active. Set framing, then Reset background before using effects.")
+        else:
+            print("[Webcam] Step out of frame for 4 seconds to capture background.")
+    else:
+        print("[Webcam] Using saved background. SPACE or Reset background captures a replacement.")
     if mode == "all":
         print("[Webcam] ALL-IN-ONE ACTIVE: Goku, Naruto, and Peace sign available simultaneously!")
     print("[Webcam] Controls: 1 Normal, 2 Naruto, 3 Goku, R reappear, C switch camera, SPACE new background, Q quit.")
@@ -1066,11 +1391,40 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
             ok, camera_frame = capture.read()
             if not ok:
                 raise RuntimeError("Webcam stopped providing video frames.")
+            new_effects, gestures_enabled = load_call_controls(controls_file)
+            if new_effects != effects_enabled:
+                effects_enabled = new_effects
+                state.phase = "ready" if background is not None else "unconfigured"
+                state.vanish_started = None
+                vanished_frame = None
+                charging_progress = 0.0
+                charging_tip = None
+                background_samples.clear()
+                if hasattr(recognizer, "reset"):
+                    recognizer.reset()
 
             if not args.no_mirror:
                 camera_frame = cv2.flip(camera_frame, 1)
+            current_framing = load_framing(framing_file)
+            if current_framing != framing:
+                framing = current_framing
+                background = None
+                background_samples.clear()
+                state.phase = "unconfigured"
+                state.vanish_started = None
+                vanished_frame = None
+                print("[Webcam] Framing changed. Live video continues; Reset background before using effects.")
+            camera_frame = apply_framing(camera_frame, framing, (args.width, args.height) if capture_size else None)
 
             height, width = camera_frame.shape[:2]
+            if background is not None and background.shape != camera_frame.shape:
+                print("[Webcam] Camera resolution changed; background invalidated.")
+                background = None
+                background_samples.clear()
+                state.phase = "unconfigured" if getattr(args, "manual_calibration", False) else "calibrating"
+                state.calibration_started = time.perf_counter()
+                state.vanish_started = None
+                vanished_frame = None
             if not virtual_camera_initialized:
                 virtual_camera = open_virtual_camera(args, width, height)
                 virtual_camera_initialized = True
@@ -1083,7 +1437,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
             elapsed_ms = int((now - started) * 1000)
             mp_image = None
 
-            if state.phase == "calibrating":
+            if not effects_enabled:
+                display = camera_frame
+            elif state.phase == "calibrating":
                 elapsed = now - state.calibration_started
                 remaining = max(0, int(np.ceil(CALIBRATION_SECONDS - elapsed)))
                 if remaining != calibration_remaining:
@@ -1098,6 +1454,13 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     else:
                         background = camera_frame.copy()
                     background_samples.clear()
+                    save_background(background_file, background)
+                    if background_framing is not None:
+                        temporary = background_framing.with_suffix(".part")
+                        temporary.write_text(json.dumps(framing.__dict__))
+                        temporary.chmod(0o600)
+                        os.replace(temporary, background_framing)
+                    background_saved_at = now
                     state.phase = "ready"
                     if mode == "all":
                         print("\n" + "=" * 68)
@@ -1113,6 +1476,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         print("[Webcam] Background ready. You can re-enter the frame.")
                 display = camera_frame
 
+            elif state.phase == "unconfigured":
+                display = camera_frame
+
             elif background is None:
                 state.phase = "calibrating"
                 state.calibration_started = now
@@ -1126,7 +1492,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                     cache=log_cache)
                 display = vanished_frame
 
-                if mode == "all":
+                if mode == "all" and gestures_enabled:
                     cooldown_elapsed = now - (state.vanish_started or 0.0)
                     if now - state.last_gesture_check >= 0.06:
                         state.last_gesture_check = now
@@ -1148,7 +1514,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                 recognizer.reset()
                         # Peace sign (action == 'normal') only vanishes, does NOT reappear.
                         # Keyboard [R] or [1] can be used to reappear from normal vanish.
-                elif mode == "goku":
+                elif mode == "goku" and gestures_enabled:
                     cooldown_elapsed = now - (state.vanish_started or 0.0)
                     if cooldown_elapsed >= 2.0:
                         if now - state.last_gesture_check >= 0.06:
@@ -1171,6 +1537,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 mask = last_mask
                 if (
                     state.phase == "ready"
+                    and gestures_enabled
                     and now - state.last_gesture_check >=
                     (0.06 if mode in ("all", "goku") else (0.08 if mode == "naruto" else GESTURE_INTERVAL_SECONDS))
                 ):
@@ -1323,11 +1690,42 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
-            cv2.imshow(WINDOW_NAME, display)
-
-            key = cv2.waitKey(1) & 0xFF
+            if preview_stream is not None:
+                if not effects_enabled:
+                    status = "Normal video: effects and gestures off"
+                elif state.phase == "calibrating":
+                    status = f"Step out: capturing background ({calibration_remaining}s)"
+                elif state.phase == "ready":
+                    status = "Live camera"
+                    if now - background_saved_at < 5:
+                        status += " · Background saved"
+                elif state.phase == "vanished":
+                    status = "Hidden: showing saved background"
+                elif state.phase == "unconfigured":
+                    status = "Live camera: set framing, then Reset background for effects"
+                else:
+                    status = state.phase.replace("_", " ").capitalize()
+                if effects_enabled and controls_file is not None:
+                    status += " · Gestures " + ("on" if gestures_enabled else "off")
+                write_preview(preview_stream, display, status)
+                key = -1
+            else:
+                cv2.imshow(WINDOW_NAME, display)
+                key = cv2.waitKey(1) & 0xFF
+            requested_key = consume_key_request(getattr(args, "key_request", None))
+            if requested_key != -1:
+                key = requested_key
+            show_myself = consume_background_reset(show_myself_request)
+            if show_myself:
+                key = ord("r")
+            if consume_background_reset(reset_request):
+                key = ord(" ")
             if key in (ord("q"), 27):
                 break
+            if not effects_enabled:
+                if virtual_camera is not None:
+                    virtual_camera.sleep_until_next_frame()
+                continue
             if key == ord(" "):
                 state.phase = "calibrating"
                 state.calibration_started = now
@@ -1341,6 +1739,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 background_samples.clear()
                 calibration_remaining = None
                 print("[Webcam] Step out of frame for 4 seconds: capturing new background.")
+            elif key == ord("c") and camera_name:
+                print(f"\n[Webcam] Camera selection is locked to '{camera_name}'.")
             elif key == ord("c"):
                 found = False
                 for try_idx in range(1, 5):
@@ -1429,7 +1829,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         play_teleport()
             elif key == ord("r"):
                 if background is not None:
-                    if last_triggered_effect == "goku" and state.phase == "vanished":
+                    if not show_myself and last_triggered_effect == "goku" and state.phase == "vanished":
                         cooldown_elapsed = now - (state.vanish_started or 0.0)
                         if cooldown_elapsed < 2.0:
                             remaining = 2.0 - cooldown_elapsed
@@ -1450,6 +1850,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         charging_tip = None
                         if hasattr(recognizer, "reset"):
                             recognizer.reset()
+                        if show_myself:
+                            print("[Webcam] App control: restored live camera.")
             elif key == ord("v") and background is not None:
                 if state.phase == "ready":
                     chosen = last_triggered_effect or ("goku" if mode == "all" else mode)
